@@ -32,6 +32,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/tikv/client-go/v2/config"
+	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	tikverr "github.com/tikv/client-go/v2/error"
 	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikv"
@@ -86,7 +87,16 @@ func newTikvClient(addr string) (tkvClient, error) {
 	}
 	logger.Infof("TiKV gc interval is set to %s", interval)
 
-	client, err := txnkv.NewClient(strings.Split(tUrl.Host, ","))
+	var clientOpts []txnkv.ClientOpt
+	if ks := query.Get("keyspace"); ks != "" {
+		logger.Infof("Using TiKV API V2 with keyspace: %s", ks)
+		clientOpts = append(clientOpts,
+			txnkv.WithKeyspace(ks),
+			txnkv.WithAPIVersion(kvrpcpb.APIVersion_V2),
+		)
+	}
+
+	client, err := txnkv.NewClient(strings.Split(tUrl.Host, ","), clientOpts...)
 	if err != nil {
 		return nil, err
 	}
