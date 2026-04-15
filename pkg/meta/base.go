@@ -2054,6 +2054,13 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 	return 0
 }
 
+func (m *baseMeta) AdvanceNextChunk(offset int64) (int64, error) {
+	if offset == 0 {
+		return m.en.getCounter("nextChunk")
+	}
+	return m.en.incrCounter("nextChunk", offset)
+}
+
 func (m *baseMeta) NewSlice(ctx Context, id *uint64) syscall.Errno {
 	m.freeMu.Lock()
 	defer m.freeMu.Unlock()

@@ -470,6 +470,10 @@ type Meta interface {
 	Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) syscall.Errno
 	// NewSlice returns an id for new slice.
 	NewSlice(ctx Context, id *uint64) syscall.Errno
+	// AdvanceNextChunk advances the nextChunk counter by offset and returns
+	// the new value. Used after TiKV BR clone to prevent slice ID collision
+	// between the original and cloned volumes.
+	AdvanceNextChunk(offset int64) (int64, error)
 	// Write put a slice of data on top of the given chunk.
 	Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno
 	// InvalidateChunkCache invalidate chunk cache
