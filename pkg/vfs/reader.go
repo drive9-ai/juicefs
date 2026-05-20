@@ -263,6 +263,21 @@ func (s *sliceReader) drop() {
 	}
 }
 
+func (s *sliceReader) close() {
+	if s.state <= BREAK {
+		s.state = BREAK
+		s.cancel()
+		s.cond.Broadcast()
+		return
+	}
+	if s.refs == 0 {
+		s.delete()
+	} else {
+		s.state = INVALID
+		s.cond.Broadcast()
+	}
+}
+
 func (s *sliceReader) delete() {
 	*(s.prev) = s.next
 	if s.next != nil {
@@ -624,14 +639,26 @@ func (f *fileReader) waitForIO(ctx meta.Context, reqs []*req, buf []byte) (int, 
 }
 
 func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, syscall.Errno) {
+	if f.r.closed.Load() {
+		return 0, syscall.EBADF
+	}
 	if f.r.readBufferUsed() > f.r.bufferSize {
 		time.Sleep(time.Millisecond * 10)             // slow down
 		for f.r.readBufferUsed() > f.r.bufferSize*2 { // readahead uses 80% of buffer, stop here to avoid OOM
+			if ctx.Canceled() {
+				return 0, syscall.EINTR
+			}
+			if f.r.closed.Load() {
+				return 0, syscall.EBADF
+			}
 			time.Sleep(time.Millisecond * 100)
 		}
 	}
 	f.Lock()
 	defer f.Unlock()
+	if f.r.closed.Load() {
+		return 0, syscall.EBADF
+	}
 	f.acquire()
 	defer f.release()
 
@@ -685,8 +712,11 @@ func (f *fileReader) visit(fn func(s *sliceReader) bool) {
 func (f *fileReader) Close(ctx meta.Context) {
 	f.Lock()
 	f.closing = true
+	if f.err == 0 {
+		f.err = syscall.EBADF
+	}
 	f.visit(func(s *sliceReader) bool {
-		s.drop()
+		s.close()
 		return true
 	})
 	f.release()
@@ -704,6 +734,10 @@ type dataReader struct {
 	readAheadTotal uint64
 	maxRequests    int
 	maxRetries     uint32
+	done           chan struct{}
+	closeOnce      sync.Once
+	wg             sync.WaitGroup
+	closed         atomic.Bool
 }
 
 func NewDataReader(conf *Config, m meta.Meta, store chunk.ChunkStore) DataReader {
@@ -722,7 +756,9 @@ func NewDataReader(conf *Config, m meta.Meta, store chunk.ChunkStore) DataReader
 		readAheadMax:   uint64(readAheadMax),
 		maxRequests:    readAheadMax/conf.Chunk.BlockSize*readSessions + 1,
 		maxRetries:     uint32(conf.Meta.Retries),
+		done:           make(chan struct{}),
 	}
+	r.wg.Add(1)
 	go r.checkReadBuffer()
 	return r
 }
@@ -733,7 +769,13 @@ func (r *dataReader) readBufferUsed() int64 {
 }
 
 func (r *dataReader) checkReadBuffer() {
+	defer r.wg.Done()
 	for {
+		select {
+		case <-r.done:
+			return
+		default:
+		}
 		r.Lock()
 		for _, f := range r.files {
 			for f != nil {
@@ -744,7 +786,11 @@ func (r *dataReader) checkReadBuffer() {
 			}
 		}
 		r.Unlock()
-		time.Sleep(time.Second)
+		select {
+		case <-r.done:
+			return
+		case <-time.After(time.Second):
+		}
 	}
 }
 
@@ -755,8 +801,21 @@ func (r *dataReader) Open(inode Ino, length uint64) FileReader {
 		length: length,
 	}
 	f.last = &(f.slices)
+	if r.closed.Load() {
+		f.closing = true
+		f.err = syscall.EBADF
+		f.refs = 1
+		return f
+	}
 
 	r.Lock()
+	if r.closed.Load() {
+		r.Unlock()
+		f.closing = true
+		f.err = syscall.EBADF
+		f.refs = 1
+		return f
+	}
 	f.refs = 1
 	f.next = r.files[inode]
 	r.files[inode] = f
@@ -808,6 +867,27 @@ func (r *dataReader) Invalidate(inode Ino, off, length uint64) {
 			return true
 		})
 	})
+}
+
+func (r *dataReader) Close() error {
+	r.closeOnce.Do(func() {
+		r.closed.Store(true)
+		close(r.done)
+		r.Lock()
+		var files []*fileReader
+		for _, f := range r.files {
+			for f != nil {
+				files = append(files, f)
+				f = f.next
+			}
+		}
+		r.Unlock()
+		for _, f := range files {
+			f.Close(meta.Background())
+		}
+		r.wg.Wait()
+	})
+	return nil
 }
 
 func (r *dataReader) readSlice(ctx context.Context, s *meta.Slice, page *chunk.Page, off int) error {

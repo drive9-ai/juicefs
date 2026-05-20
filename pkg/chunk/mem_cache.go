@@ -38,6 +38,10 @@ type memcache struct {
 	pages       map[string]memItem
 	eviction    string
 	cacheExpire time.Duration
+	done        chan struct{}
+	closeOnce   sync.Once
+	wg          sync.WaitGroup
+	closed      bool
 
 	metrics *cacheManagerMetrics
 }
@@ -49,6 +53,7 @@ func newMemStore(config *Config, metrics *cacheManagerMetrics) *memcache {
 		pages:       make(map[string]memItem),
 		eviction:    config.CacheEviction,
 		cacheExpire: config.CacheExpire,
+		done:        make(chan struct{}),
 		metrics:     metrics,
 	}
 	runtime.SetFinalizer(c, func(c *memcache) {
@@ -58,6 +63,7 @@ func newMemStore(config *Config, metrics *cacheManagerMetrics) *memcache {
 		c.pages = nil
 	})
 	if c.cacheExpire > 0 {
+		c.wg.Add(1)
 		go c.cleanupExpire()
 	}
 	return c
@@ -85,6 +91,9 @@ func (c *memcache) cache(key string, p *Page, force, dropCache bool) {
 	}
 	c.Lock()
 	defer c.Unlock()
+	if c.closed {
+		return
+	}
 	if c.full() && c.eviction == EvictionNone {
 		logger.Debugf("Caching is full, drop %s (%d bytes)", key, len(p.Data))
 		c.metrics.cacheDrops.Add(1)
@@ -177,6 +186,7 @@ func (c *memcache) full() bool {
 }
 
 func (c *memcache) cleanupExpire() {
+	defer c.wg.Done()
 	var interval = time.Minute
 	if c.cacheExpire < time.Minute {
 		interval = c.cacheExpire
@@ -202,7 +212,12 @@ func (c *memcache) cleanupExpire() {
 		if deleted > 0 {
 			logger.Debugf("Expired cache blocks: %d blocks (%s), remaining: %d blocks (%s)", deleted, humanize.IBytes(uint64(freed)), len(c.pages), humanize.IBytes(uint64(c.used)))
 		}
-		time.Sleep(interval / 1000 * time.Duration((cnt+1-deleted)*1000/(cnt+1)))
+		sleep := interval / 1000 * time.Duration((cnt+1-deleted)*1000/(cnt+1))
+		select {
+		case <-c.done:
+			return
+		case <-time.After(sleep):
+		}
 	}
 }
 
@@ -212,3 +227,24 @@ func (c *memcache) stage(key string, data []byte, tierID uint8) (string, error) 
 func (c *memcache) uploaded(key string, size int)    {}
 func (c *memcache) isEmpty() bool                    { return false }
 func (c *memcache) getMetrics() *cacheManagerMetrics { return c.metrics }
+
+func (c *memcache) close() {
+	c.closeOnce.Do(func() {
+		close(c.done)
+		c.wg.Wait()
+		c.Lock()
+		c.closed = true
+		keys := make([]string, 0, len(c.pages))
+		for k := range c.pages {
+			keys = append(keys, k)
+		}
+		for _, k := range keys {
+			item := c.pages[k]
+			c.delete(k, item.page)
+		}
+		c.pages = make(map[string]memItem)
+		c.used = 0
+		c.Unlock()
+		runtime.SetFinalizer(c, nil)
+	})
+}

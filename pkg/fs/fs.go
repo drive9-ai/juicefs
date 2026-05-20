@@ -147,8 +147,12 @@ type FileSystem struct {
 	cacheM          sync.Mutex
 	entries         map[Ino]map[string]*entryCache
 	attrs           map[Ino]*attrCache
+	done            chan struct{}
+	closeOnce       sync.Once
+	wg              sync.WaitGroup
 	checkAccessFile time.Duration
 	rotateAccessLog int64
+	logMu           sync.Mutex
 	logBuffer       chan string
 
 	readSizeHistogram     prometheus.Histogram
@@ -188,6 +192,7 @@ func NewFileSystem(conf *vfs.Config, m meta.Meta, d chunk.ChunkStore, registry *
 		writer:          vfs.NewDataWriter(conf, m, d, reader),
 		entries:         make(map[meta.Ino]map[string]*entryCache),
 		attrs:           make(map[meta.Ino]*attrCache),
+		done:            make(chan struct{}),
 		checkAccessFile: time.Minute,
 		rotateAccessLog: 300 << 20, // 300 MiB
 
@@ -221,6 +226,7 @@ func NewFileSystem(conf *vfs.Config, m meta.Meta, d chunk.ChunkStore, registry *
 		}
 	}
 
+	fs.wg.Add(1)
 	go fs.cleanupCache()
 	if conf.AccessLog != "" {
 		f, err := os.OpenFile(conf.AccessLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -229,6 +235,7 @@ func NewFileSystem(conf *vfs.Config, m meta.Meta, d chunk.ChunkStore, registry *
 		} else {
 			_ = os.Chmod(conf.AccessLog, 0666)
 			fs.logBuffer = make(chan string, 1024)
+			fs.wg.Add(1)
 			go fs.flushLog(f, fs.logBuffer, conf.AccessLog)
 		}
 	}
@@ -245,7 +252,13 @@ func (fs *FileSystem) InitMetrics(reg prometheus.Registerer) {
 }
 
 func (fs *FileSystem) cleanupCache() {
+	defer fs.wg.Done()
 	for {
+		select {
+		case <-fs.done:
+			return
+		default:
+		}
 		fs.cacheM.Lock()
 		now := time.Now()
 		var cnt int
@@ -275,7 +288,11 @@ func (fs *FileSystem) cleanupCache() {
 			}
 		}
 		fs.cacheM.Unlock()
-		time.Sleep(time.Second)
+		select {
+		case <-fs.done:
+			return
+		case <-time.After(time.Second):
+		}
 	}
 }
 
@@ -300,14 +317,16 @@ func (fs *FileSystem) InvalidateAttr(ino Ino) {
 func (fs *FileSystem) log(ctx LogContext, format string, args ...interface{}) {
 	used := ctx.Duration()
 	fs.opsDurationsHistogram.Observe(used.Seconds())
-	if fs.logBuffer == nil {
-		return
-	}
 	now := utils.Now()
 	cmd := fmt.Sprintf(format, args...)
 	ts := now.Format("2006.01.02 15:04:05.000000")
 	cmd += fmt.Sprintf(" <%.6f>", used.Seconds())
 	line := fmt.Sprintf("%s [uid:%d,gid:%d,pid:%d] %s\n", ts, ctx.Uid(), ctx.Gid(), ctx.Pid(), cmd)
+	fs.logMu.Lock()
+	defer fs.logMu.Unlock()
+	if fs.logBuffer == nil {
+		return
+	}
 	select {
 	case fs.logBuffer <- line:
 	default:
@@ -316,15 +335,23 @@ func (fs *FileSystem) log(ctx LogContext, format string, args ...interface{}) {
 }
 
 func (fs *FileSystem) flushLog(f *os.File, logBuffer chan string, path string) {
+	defer fs.wg.Done()
+	defer func() { _ = f.Close() }()
 	buf := make([]byte, 0, 128<<10)
 	var lastcheck = time.Now()
 	for {
-		line := <-logBuffer
+		line, ok := <-logBuffer
+		if !ok {
+			return
+		}
 		buf = append(buf[:0], []byte(line)...)
 	LOOP:
 		for len(buf) < (128 << 10) {
 			select {
-			case line = <-logBuffer:
+			case line, ok = <-logBuffer:
+				if !ok {
+					break LOOP
+				}
 				buf = append(buf, []byte(line)...)
 			default:
 				break LOOP
@@ -1076,22 +1103,40 @@ func (fs *FileSystem) Create(ctx meta.Context, p string, mode uint16, umask uint
 }
 
 func (fs *FileSystem) Flush() error {
+	fs.logMu.Lock()
 	buffer := fs.logBuffer
 	if buffer != nil {
 		buffer <- "" // flush
 	}
+	fs.logMu.Unlock()
 	fs.Meta().FlushSession()
 	return nil
 }
 
 func (fs *FileSystem) Close() error {
-	_ = fs.Flush()
-	buffer := fs.logBuffer
-	if buffer != nil {
-		fs.logBuffer = nil
-		close(buffer)
-	}
-	return nil
+	var err error
+	fs.closeOnce.Do(func() {
+		err = errors.Join(err, fs.Flush())
+		close(fs.done)
+		fs.logMu.Lock()
+		buffer := fs.logBuffer
+		if buffer != nil {
+			fs.logBuffer = nil
+			close(buffer)
+		}
+		fs.logMu.Unlock()
+		fs.wg.Wait()
+		if c, ok := fs.writer.(io.Closer); ok {
+			err = errors.Join(err, c.Close())
+		}
+		if c, ok := fs.reader.(io.Closer); ok {
+			err = errors.Join(err, c.Close())
+		}
+		if c, ok := fs.store.(io.Closer); ok {
+			err = errors.Join(err, c.Close())
+		}
+	})
+	return err
 }
 
 func (fs *FileSystem) Clone(ctx meta.Context, src, dst string, preserve bool) (err syscall.Errno) {

@@ -294,6 +294,7 @@ func newRedisMeta(driver, addr string, conf *Config) (Meta, error) {
 }
 
 func (m *redisMeta) Shutdown() error {
+	m.shutdownBase()
 	if m.cache != nil {
 		m.cache.close()
 		m.cache = nil

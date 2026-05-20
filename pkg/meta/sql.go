@@ -540,6 +540,7 @@ func newSQLMeta(driver, addr string, conf *Config) (Meta, error) {
 }
 
 func (m *dbMeta) Shutdown() error {
+	m.shutdownBase()
 	return m.db.Close()
 }
 

@@ -397,6 +397,16 @@ func (store *cachedStore) upload(ctx context.Context, key string, block *Page, s
 	return err
 }
 
+func (store *cachedStore) addWorker() bool {
+	store.wgMu.Lock()
+	defer store.wgMu.Unlock()
+	if store.closed.Load() {
+		return false
+	}
+	store.wg.Add(1)
+	return true
+}
+
 func (s *wSlice) upload(indx int) {
 	blen := s.blockSize(indx)
 	key := s.key(indx)
@@ -404,7 +414,15 @@ func (s *wSlice) upload(indx int) {
 	s.pages[indx] = nil
 	s.pendings++
 
+	if !s.store.addWorker() {
+		for _, p := range pages {
+			freePage(p)
+		}
+		s.errors <- errors.New("chunk store is closed")
+		return
+	}
 	go func() {
+		defer s.store.wg.Done()
 		var block *Page
 		var off int
 		if len(pages) == 1 {
@@ -442,9 +460,8 @@ func (s *wSlice) upload(indx int) {
 			} else {
 				s.errors <- nil
 				if s.store.conf.UploadDelay == 0 && s.store.canUpload() {
-					select {
-					case s.store.currentUpload <- struct{}{}:
-						defer func() { <-s.store.currentUpload }()
+					if s.store.tryAcquireUploadSlot() {
+						defer s.store.releaseUploadSlot()
 						if err = s.store.upload(ctx, key, block, nil); err == nil {
 							s.store.bcache.uploaded(key, blen)
 							if err := s.store.bcache.removeStage(key); err != nil {
@@ -454,7 +471,6 @@ func (s *wSlice) upload(indx int) {
 							s.store.addDelayedStaging(key, stagingPath, time.Now(), false)
 						}
 						return
-					default:
 					}
 				}
 				block.Release()
@@ -462,8 +478,12 @@ func (s *wSlice) upload(indx int) {
 				return
 			}
 		}
-		s.store.currentUpload <- struct{}{}
-		defer func() { <-s.store.currentUpload }()
+		if !s.store.acquireUploadSlot() {
+			block.Release()
+			s.errors <- errors.New("chunk store is closed")
+			return
+		}
+		defer s.store.releaseUploadSlot()
 		s.errors <- s.store.upload(ctx, key, block, s)
 	}()
 }
@@ -674,6 +694,11 @@ type cachedStore struct {
 	pendingCh       chan *pendingItem
 	pendingKeys     map[string]*pendingItem
 	pendingMutex    sync.Mutex
+	done            chan struct{}
+	closeOnce       sync.Once
+	wgMu            sync.Mutex
+	wg              sync.WaitGroup
+	closed          atomic.Bool
 	startHour       int
 	endHour         int
 	compressor      compress.Compressor
@@ -846,6 +871,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		seekable:        compressor.CompressBound(0) == 0,
 		pendingCh:       make(chan *pendingItem, 100*config.MaxUpload),
 		pendingKeys:     make(map[string]*pendingItem),
+		done:            make(chan struct{}),
 		group:           NewController(),
 	}
 	if config.UploadLimit > 0 {
@@ -871,15 +897,26 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		}
 	})
 
+	store.wg.Add(1)
 	go func() {
+		defer store.wg.Done()
 		for {
+			select {
+			case <-store.done:
+				return
+			default:
+			}
 			if store.bcache.isEmpty() {
 				logger.Warn("cache store is empty, use memory cache")
 				config.CacheSize = 100 << 20
 				config.CacheDir = "memory"
 				store.bcache = newMemStore(&config, store.bcache.getMetrics())
 			}
-			time.Sleep(time.Second)
+			select {
+			case <-store.done:
+				return
+			case <-time.After(time.Second):
+			}
 		}
 	}()
 
@@ -906,6 +943,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 
 	if store.conf.Writeback {
 		for i := 0; i < store.conf.MaxUpload; i++ {
+			store.wg.Add(1)
 			go store.uploader()
 		}
 		interval := time.Minute
@@ -917,9 +955,15 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 				logger.Infof("delay uploading by %s", d)
 			}
 		}
+		store.wg.Add(1)
 		go func() {
+			defer store.wg.Done()
 			for {
-				time.Sleep(interval)
+				select {
+				case <-store.done:
+					return
+				case <-time.After(interval):
+				}
 				store.scanDelayedStaging()
 			}
 		}()
@@ -1026,10 +1070,10 @@ func parseObjOrigSize(key string) int {
 }
 
 func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
-	store.currentUpload <- struct{}{}
-	defer func() {
-		<-store.currentUpload
-	}()
+	if !store.acquireUploadSlot() {
+		return
+	}
+	defer store.releaseUploadSlot()
 
 	store.pendingMutex.Lock()
 	item, ok := store.pendingKeys[key]
@@ -1090,7 +1134,14 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 }
 
 func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.Time, force bool) bool {
+	if store.closed.Load() {
+		return false
+	}
 	store.pendingMutex.Lock()
+	if store.closed.Load() {
+		store.pendingMutex.Unlock()
+		return false
+	}
 	item := store.pendingKeys[key]
 	if item == nil {
 		item = &pendingItem{key, stagingPath, added, atomic.Bool{}}
@@ -1102,6 +1153,8 @@ func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.
 			select {
 			case store.pendingCh <- item:
 				return true
+			case <-store.done:
+				item.uploading.Store(false)
 			default:
 				item.uploading.Store(false)
 			}
@@ -1126,6 +1179,9 @@ func (store *cachedStore) isPendingValid(key string) bool {
 }
 
 func (store *cachedStore) scanDelayedStaging() {
+	if store.closed.Load() {
+		return
+	}
 	if !store.canUpload() {
 		return
 	}
@@ -1135,16 +1191,81 @@ func (store *cachedStore) scanDelayedStaging() {
 	for _, item := range store.pendingKeys {
 		store.pendingMutex.Unlock()
 		if item.ts.Before(cutoff) && item.uploading.CompareAndSwap(false, true) {
-			store.pendingCh <- item
+			select {
+			case store.pendingCh <- item:
+			case <-store.done:
+				item.uploading.Store(false)
+				return
+			}
 		}
 		store.pendingMutex.Lock()
 	}
 }
 
 func (store *cachedStore) uploader() {
-	for it := range store.pendingCh {
-		store.uploadStagingFile(it.key, it.fpath)
+	defer store.wg.Done()
+	for {
+		select {
+		case it := <-store.pendingCh:
+			store.uploadStagingFile(it.key, it.fpath)
+		case <-store.done:
+			return
+		}
 	}
+}
+
+func (store *cachedStore) acquireUploadSlot() bool {
+	if store.closed.Load() {
+		return false
+	}
+	select {
+	case store.currentUpload <- struct{}{}:
+		if store.closed.Load() {
+			store.releaseUploadSlot()
+			return false
+		}
+		return true
+	case <-store.done:
+		return false
+	}
+}
+
+func (store *cachedStore) tryAcquireUploadSlot() bool {
+	if store.closed.Load() {
+		return false
+	}
+	select {
+	case store.currentUpload <- struct{}{}:
+		if store.closed.Load() {
+			store.releaseUploadSlot()
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func (store *cachedStore) releaseUploadSlot() {
+	<-store.currentUpload
+}
+
+func (store *cachedStore) Close() error {
+	store.closeOnce.Do(func() {
+		store.wgMu.Lock()
+		store.closed.Store(true)
+		close(store.done)
+		store.wgMu.Unlock()
+		if store.fetcher != nil {
+			store.fetcher.Close()
+		}
+		store.wg.Wait()
+		store.pendingMutex.Lock()
+		store.pendingKeys = make(map[string]*pendingItem)
+		store.pendingMutex.Unlock()
+		store.bcache.close()
+	})
+	return nil
 }
 
 func (store *cachedStore) canUpload() bool {

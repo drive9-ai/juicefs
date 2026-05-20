@@ -43,9 +43,12 @@ func (o *openFile) release() {
 
 type openfiles struct {
 	sync.Mutex
-	expire time.Duration
-	limit  uint64
-	files  map[Ino]*openFile
+	expire    time.Duration
+	limit     uint64
+	files     map[Ino]*openFile
+	done      chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 }
 
 func newOpenFiles(expire time.Duration, limit uint64) *openfiles {
@@ -53,13 +56,21 @@ func newOpenFiles(expire time.Duration, limit uint64) *openfiles {
 		expire: expire,
 		limit:  limit,
 		files:  make(map[Ino]*openFile),
+		done:   make(chan struct{}),
 	}
+	of.wg.Add(1)
 	go of.cleanup()
 	return of
 }
 
 func (o *openfiles) cleanup() {
+	defer o.wg.Done()
 	for {
+		select {
+		case <-o.done:
+			return
+		default:
+		}
 		var (
 			cnt, deleted, todel int
 			candidateIno        Ino
@@ -101,8 +112,20 @@ func (o *openfiles) cleanup() {
 			}
 		}
 		o.Unlock()
-		time.Sleep(time.Millisecond * time.Duration(1000*(cnt+1-deleted*2)/(cnt+1)))
+		sleep := time.Millisecond * time.Duration(1000*(cnt+1-deleted*2)/(cnt+1))
+		select {
+		case <-o.done:
+			return
+		case <-time.After(sleep):
+		}
 	}
+}
+
+func (o *openfiles) Shutdown() {
+	o.closeOnce.Do(func() {
+		close(o.done)
+	})
+	o.wg.Wait()
 }
 
 func (o *openfiles) OpenCheck(ino Ino, attr *Attr) bool {

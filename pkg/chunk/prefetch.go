@@ -22,9 +22,12 @@ import (
 
 type prefetcher struct {
 	sync.Mutex
-	pending chan string
-	busy    map[string]bool
-	op      func(key string)
+	pending   chan string
+	busy      map[string]bool
+	op        func(key string)
+	closeOnce sync.Once
+	wg        sync.WaitGroup
+	closed    bool
 }
 
 func newPrefetcher(parallel int, fetch func(string)) *prefetcher {
@@ -34,12 +37,14 @@ func newPrefetcher(parallel int, fetch func(string)) *prefetcher {
 		op:      fetch,
 	}
 	for i := 0; i < parallel; i++ {
+		p.wg.Add(1)
 		go p.do()
 	}
 	return p
 }
 
 func (p *prefetcher) do() {
+	defer p.wg.Done()
 	for key := range p.pending {
 		p.op(key)
 
@@ -52,6 +57,9 @@ func (p *prefetcher) do() {
 func (p *prefetcher) fetch(key string) {
 	p.Lock()
 	defer p.Unlock()
+	if p.closed {
+		return
+	}
 	if _, ok := p.busy[key]; ok {
 		return
 	}
@@ -60,4 +68,14 @@ func (p *prefetcher) fetch(key string) {
 		p.busy[key] = true
 	default:
 	}
+}
+
+func (p *prefetcher) Close() {
+	p.closeOnce.Do(func() {
+		p.Lock()
+		p.closed = true
+		close(p.pending)
+		p.Unlock()
+	})
+	p.wg.Wait()
 }
