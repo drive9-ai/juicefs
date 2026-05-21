@@ -101,13 +101,14 @@ type sliceReader struct {
 	currentPos uint32
 	lastAccess time.Time
 	cond       *utils.Cond
+	timer      *time.Timer
 	next       *sliceReader
 	prev       **sliceReader
 	refs       uint16
 }
 
 func (s *sliceReader) delay(delay time.Duration) {
-	time.AfterFunc(delay, s.run)
+	s.timer = time.AfterFunc(delay, s.run)
 }
 
 func (s *sliceReader) done(err syscall.Errno, delay time.Duration) {
@@ -163,6 +164,7 @@ func (s *sliceReader) run() {
 	f := s.file
 	f.Lock()
 	defer f.Unlock()
+	s.timer = nil
 	if s.state != NEW || f.shouldStop() {
 		s.done(0, 0)
 	}
@@ -265,9 +267,20 @@ func (s *sliceReader) drop() {
 
 func (s *sliceReader) close() {
 	if s.state <= BREAK {
+		stopped := false
+		if s.timer != nil {
+			stopped = s.timer.Stop()
+			s.timer = nil
+		}
 		s.state = BREAK
 		s.cancel()
 		s.cond.Broadcast()
+		if stopped {
+			s.state = INVALID
+			if s.refs == 0 {
+				s.delete()
+			}
+		}
 		return
 	}
 	if s.refs == 0 {
