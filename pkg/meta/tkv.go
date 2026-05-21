@@ -112,6 +112,7 @@ func newKVMeta(driver, addr string, conf *Config) (Meta, error) {
 }
 
 func (m *kvMeta) Shutdown() error {
+	m.shutdownBase()
 	return m.client.close()
 }
 

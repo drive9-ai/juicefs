@@ -82,8 +82,9 @@ type dcState interface {
 }
 
 type baseDC struct {
-	cache  *cacheStore
-	stopCh chan struct{}
+	cache   *cacheStore
+	stopCh  chan struct{}
+	stopped atomic.Bool
 }
 
 func newDCState(state int, cs *cacheStore) dcState {
@@ -109,7 +110,9 @@ func (dc *baseDC) init(cs *cacheStore) {
 }
 
 func (dc *baseDC) stop() {
-	close(dc.stopCh)
+	if dc.stopped.CompareAndSwap(false, true) {
+		close(dc.stopCh)
+	}
 }
 func (dc *baseDC) onIOErr()            {}
 func (dc *baseDC) onIOSucc()           {}

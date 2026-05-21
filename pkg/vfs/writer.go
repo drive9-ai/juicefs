@@ -20,6 +20,7 @@ import (
 	"math/rand"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -39,6 +40,28 @@ type FileWriter interface {
 	GetLength() uint64
 	Truncate(length uint64)
 }
+
+type closedFileWriter struct {
+	length uint64
+}
+
+func (w closedFileWriter) Write(ctx meta.Context, offset uint64, data []byte) syscall.Errno {
+	return syscall.EBADF
+}
+
+func (w closedFileWriter) Flush(ctx meta.Context) syscall.Errno {
+	return syscall.EBADF
+}
+
+func (w closedFileWriter) Close(ctx meta.Context) syscall.Errno {
+	return syscall.EBADF
+}
+
+func (w closedFileWriter) GetLength() uint64 {
+	return w.length
+}
+
+func (w closedFileWriter) Truncate(length uint64) {}
 
 type DataWriter interface {
 	Open(inode Ino, fleng uint64, tierID uint8) FileWriter
@@ -69,6 +92,10 @@ func (s *sliceWriter) prepareID(ctx meta.Context, retry bool) {
 	f := s.chunk.file
 	f.Lock()
 	for s.id == 0 {
+		if ctx.Canceled() {
+			s.err = syscall.EINTR
+			break
+		}
 		var id uint64
 		f.Unlock()
 		st := f.w.m.NewSlice(ctx, &id)
@@ -103,14 +130,18 @@ func (s *sliceWriter) markDone() {
 }
 
 // freezed, no more data
-func (s *sliceWriter) flushData() {
+func (s *sliceWriter) flushData(ctx meta.Context) {
 	defer s.markDone()
 	if s.slen == 0 {
 		return
 	}
-	s.prepareID(meta.Background(), true)
-	if s.err != 0 {
-		logger.Infof("flush inode: %v chunk: %d err: %s", s.chunk.file.inode, s.id, s.err)
+	s.prepareID(ctx, true)
+	f := s.chunk.file
+	f.Lock()
+	err := s.err
+	f.Unlock()
+	if err != 0 {
+		logger.Infof("flush inode: %v chunk: %d err: %s", s.chunk.file.inode, s.id, err)
 		s.writer.Abort()
 		return
 	}
@@ -119,7 +150,9 @@ func (s *sliceWriter) flushData() {
 		logger.Errorf("upload inode: %v chunk: %v (length: %v) fail: %s", s.chunk.file.inode, s.id, s.length, err)
 
 		s.writer.Abort()
+		f.Lock()
 		s.err = syscall.EIO
+		f.Unlock()
 	}
 }
 
@@ -137,7 +170,7 @@ func (s *sliceWriter) write(ctx meta.Context, off uint32, data []uint8) syscall.
 	s.lastMod = time.Now()
 	if s.slen == meta.ChunkSize {
 		s.freezed = true
-		go s.flushData()
+		go s.flushData(meta.Background())
 	} else if int(s.slen) >= f.w.blockSize {
 		if s.id > 0 {
 			err := s.writer.FlushTo(int(s.slen))
@@ -167,7 +200,7 @@ func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 				return s
 			} else if i > 3 {
 				s.freezed = true
-				go s.flushData()
+				go s.flushData(meta.Background())
 			}
 		}
 		if pos < s.off+s.slen && s.off < pos+size {
@@ -190,7 +223,7 @@ func (c *chunkWriter) commitThread() {
 		for !s.done {
 			if s.notify.WaitWithTimeout(time.Millisecond*100) && !s.freezed && time.Since(s.started) > flushDuration*2 {
 				s.freezed = true
-				go s.flushData()
+				go s.flushData(meta.Background())
 			}
 		}
 		err := s.err
@@ -229,6 +262,7 @@ type fileWriter struct {
 	length       uint64
 	tierID       uint8
 	err          syscall.Errno
+	closing      bool
 	flushwaiting uint16
 	writewaiting uint16
 	refs         uint16
@@ -295,13 +329,28 @@ func (w *dataWriter) usedBufferSize() int64 {
 }
 
 func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Errno {
+	if f.w.closed.Load() {
+		return syscall.EBADF
+	}
 	for f.totalSlices() >= 1000 {
+		if ctx.Canceled() {
+			return syscall.EINTR
+		}
+		if f.w.closed.Load() {
+			return syscall.EBADF
+		}
 		time.Sleep(time.Millisecond)
 	}
 	if f.w.usedBufferSize() > f.w.bufferSize {
 		// slow down
 		time.Sleep(time.Millisecond * 10)
 		for f.w.usedBufferSize() > f.w.bufferSize*2 {
+			if ctx.Canceled() {
+				return syscall.EINTR
+			}
+			if f.w.closed.Load() {
+				return syscall.EBADF
+			}
 			time.Sleep(time.Millisecond * 100)
 		}
 	}
@@ -309,16 +358,24 @@ func (f *fileWriter) Write(ctx meta.Context, off uint64, data []byte) syscall.Er
 	s := time.Now()
 	f.Lock()
 	defer f.Unlock()
+	if f.closing || f.w.closed.Load() {
+		return syscall.EBADF
+	}
 	size := uint64(len(data))
 	f.writewaiting++
-	for f.flushwaiting > 0 {
+	defer func() { f.writewaiting-- }()
+	for f.flushwaiting > 0 && !f.closing {
 		if f.writecond.WaitWithTimeout(time.Second) && ctx.Canceled() {
-			f.writewaiting--
 			logger.Warnf("write %d interrupted after %d", f.inode, time.Since(s))
 			return syscall.EINTR
 		}
 	}
-	f.writewaiting--
+	if f.closing {
+		return syscall.EBADF
+	}
+	if f.w.closed.Load() {
+		return syscall.EBADF
+	}
 
 	indx := uint32(off / meta.ChunkSize)
 	pos := uint32(off % meta.ChunkSize)
@@ -367,11 +424,15 @@ func (f *fileWriter) flush(ctx meta.Context, writeback bool) syscall.Errno {
 			for _, s := range c.slices {
 				if !s.freezed {
 					s.freezed = true
-					go s.flushData()
+					go s.flushData(ctx)
 				}
 			}
 		}
-		if f.flushcond.WaitWithTimeout(time.Second*3) && ctx.Canceled() && time.Since(s) > f.w.conf.Chunk.PutTimeout*2 {
+		wait := time.Second * 3
+		if f.w.closed.Load() && f.w.conf.Chunk.PutTimeout > 0 && f.w.conf.Chunk.PutTimeout < wait {
+			wait = f.w.conf.Chunk.PutTimeout
+		}
+		if f.flushcond.WaitWithTimeout(wait) && ctx.Canceled() && (f.w.closed.Load() || time.Since(s) > f.w.conf.Chunk.PutTimeout*2) {
 			logger.Warnf("flush %d interrupted after %d", f.inode, time.Since(s))
 			err = syscall.EINTR
 			break
@@ -409,6 +470,15 @@ func (f *fileWriter) Close(ctx meta.Context) syscall.Errno {
 	return f.Flush(ctx)
 }
 
+func (f *fileWriter) closeForDataWriter() {
+	f.Lock()
+	f.closing = true
+	if f.writewaiting > 0 {
+		f.writecond.Broadcast()
+	}
+	f.Unlock()
+}
+
 func (f *fileWriter) GetLength() uint64 {
 	f.Lock()
 	defer f.Unlock()
@@ -432,6 +502,10 @@ type dataWriter struct {
 	bufferSize int64
 	files      map[Ino]*fileWriter
 	maxRetries uint32
+	done       chan struct{}
+	closeOnce  sync.Once
+	wg         sync.WaitGroup
+	closed     atomic.Bool
 }
 
 func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader DataReader) DataWriter {
@@ -444,13 +518,21 @@ func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader Dat
 		bufferSize: int64(conf.Chunk.BufferSize),
 		files:      make(map[Ino]*fileWriter),
 		maxRetries: uint32(conf.Meta.Retries),
+		done:       make(chan struct{}),
 	}
+	w.wg.Add(1)
 	go w.flushAll()
 	return w
 }
 
 func (w *dataWriter) flushAll() {
+	defer w.wg.Done()
 	for {
+		select {
+		case <-w.done:
+			return
+		default:
+		}
 		w.Lock()
 		now := time.Now()
 		for _, f := range w.files {
@@ -466,7 +548,7 @@ func (w *dataWriter) flushAll() {
 					if !s.freezed && (now.Sub(s.started) > flushDuration || now.Sub(s.lastMod) > time.Second && now.Sub(s.started) > time.Second ||
 						tooMany && i%2 == lastBit && j <= hs) {
 						s.freezed = true
-						go s.flushData()
+						go s.flushData(meta.Background())
 					}
 				}
 			}
@@ -475,13 +557,23 @@ func (w *dataWriter) flushAll() {
 			w.Lock()
 		}
 		w.Unlock()
-		time.Sleep(time.Millisecond * 100)
+		select {
+		case <-w.done:
+			return
+		case <-time.After(time.Millisecond * 100):
+		}
 	}
 }
 
 func (w *dataWriter) Open(inode Ino, len uint64, tierID uint8) FileWriter {
+	if w.closed.Load() {
+		return closedFileWriter{length: len}
+	}
 	w.Lock()
 	defer w.Unlock()
+	if w.closed.Load() {
+		return closedFileWriter{length: len}
+	}
 	f, ok := w.files[inode]
 	if !ok {
 		f = &fileWriter{
@@ -509,7 +601,7 @@ func (w *dataWriter) free(f *fileWriter) {
 	w.Lock()
 	defer w.Unlock()
 	f.refs--
-	if f.refs == 0 {
+	if f.refs == 0 && w.files[f.inode] == f {
 		delete(w.files, f.inode)
 	}
 }
@@ -544,21 +636,107 @@ func (w *dataWriter) UpdateMtime(inode Ino, mtime time.Time) {
 	}
 }
 
-func (w *dataWriter) FlushAll() error {
+func (w *dataWriter) flushAllFiles(ctx meta.Context, abortOnError bool) error {
 	var err error
 	w.Lock()
 	for inode, ind := range w.files {
 		ind.refs++
 		w.Unlock()
-		eno := ind.Flush(meta.Background())
-		w.free(ind)
+		eno := ind.Flush(ctx)
 		if eno != 0 {
 			logger.Errorf("flush %s: %s", inode, eno)
+			if abortOnError {
+				ind.abortPending()
+			}
+			w.free(ind)
 			return eno
 		}
+		w.free(ind)
 		logger.Debugf("Flush %d", inode)
 		w.Lock()
 	}
 	w.Unlock()
 	return err
+}
+
+func (w *dataWriter) FlushAll() error {
+	return w.flushAllFiles(meta.Background(), false)
+}
+
+func (w *dataWriter) closeTrackedWriters() {
+	w.Lock()
+	files := make([]*fileWriter, 0, len(w.files))
+	for _, f := range w.files {
+		files = append(files, f)
+	}
+	w.Unlock()
+
+	for _, f := range files {
+		f.closeForDataWriter()
+	}
+}
+
+func (w *dataWriter) closeFlushTimeout() time.Duration {
+	timeout := w.conf.Chunk.PutTimeout * 2
+	if timeout <= 0 {
+		timeout = time.Minute * 2
+	}
+	if timeout < time.Millisecond {
+		timeout = time.Millisecond
+	}
+	return timeout
+}
+
+func (w *dataWriter) Close() error {
+	var err error
+	w.closeOnce.Do(func() {
+		close(w.done)
+		w.wg.Wait()
+		w.closed.Store(true)
+		w.closeTrackedWriters()
+		ctx := meta.WrapWithTimeout(meta.Background(), w.closeFlushTimeout())
+		defer ctx.Cancel()
+		err = w.flushAllFiles(ctx, true)
+		if err == nil && ctx.Canceled() {
+			err = syscall.EINTR
+		}
+		if err != nil {
+			w.abortPending()
+		}
+	})
+	return err
+}
+
+func (w *dataWriter) abortPending() {
+	w.Lock()
+	files := make([]*fileWriter, 0, len(w.files))
+	for _, f := range w.files {
+		f.refs++
+		files = append(files, f)
+	}
+	w.Unlock()
+
+	for _, f := range files {
+		f.abortPending()
+		w.free(f)
+	}
+}
+
+func (f *fileWriter) abortPending() {
+	f.Lock()
+	defer f.Unlock()
+	for _, c := range f.chunks {
+		for _, s := range c.slices {
+			if s.done {
+				continue
+			}
+			s.freezed = true
+			s.err = syscall.EIO
+			s.writer.Abort()
+			s.done = true
+			s.notify.Signal()
+		}
+	}
+	f.flushcond.Broadcast()
+	f.writecond.Broadcast()
 }
