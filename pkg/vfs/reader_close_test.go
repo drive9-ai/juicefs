@@ -26,6 +26,7 @@ import (
 
 	"github.com/juicedata/juicefs/pkg/chunk"
 	"github.com/juicedata/juicefs/pkg/meta"
+	"github.com/juicedata/juicefs/pkg/utils"
 )
 
 type closeReadMeta struct {
@@ -113,5 +114,46 @@ func TestDataReaderCloseInterruptsInFlightRead(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("read did not return after close")
+	}
+}
+
+func TestDataReaderCloseReleasesDelayedRetryReadBuffer(t *testing.T) {
+	r := &dataReader{
+		files: make(map[Ino]*fileReader),
+		done:  make(chan struct{}),
+	}
+	f := &fileReader{
+		r:      r,
+		inode:  1,
+		length: 4,
+		refs:   1,
+	}
+	page := chunk.NewOffPage(4)
+	s := &sliceReader{
+		file:  f,
+		block: &frange{off: 0, len: 4},
+		state: NEW,
+		page:  page,
+		cond:  utils.NewCond(&f.Mutex),
+	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.prev = &f.slices
+	f.slices = s
+	f.last = &s.next
+	r.files[f.inode] = f
+	readBufferUsed.Add(int64(cap(s.page.Data)))
+	s.delay(time.Hour)
+
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %s", err)
+	}
+	if page.Data != nil {
+		t.Fatal("delayed retry page was not released during close")
+	}
+	if f.slices != nil {
+		t.Fatal("delayed retry slice is still linked after close")
+	}
+	if got := r.files[f.inode]; got != nil {
+		t.Fatalf("file reader still tracked after close: %p", got)
 	}
 }
