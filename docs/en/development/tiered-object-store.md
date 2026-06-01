@@ -386,11 +386,18 @@ Constraints:
 - Cover real small/large routing, small<->large overwrite, cleanup/checker behavior, and upload-before-index-commit failure recovery.
 - Keep the backend unregistered and non-production.
 
+### PR 7 — fail-closed config scaffold (`drive9-ai/juicefs`)
+- Add an internal config constructor for the experimental store.
+- Disabled config must fail closed before creating SQL schema or returning a store.
+- Invalid config must reject nil SQL DB, nil large store, empty volume ID, non-positive threshold, and empty/unknown SQL dialect.
+- Existing volume config mismatch must fail closed through the SQL metadata guard.
+- Keep the backend unregistered and non-production.
+
 ### Later — benchmark/e2e and runtime registration (`drive9-ai/juicefs`; optional Drive9 integration config in `drive9-ai/drive9`)
 - Compare S3+writeback, whole-volume TiDB/TiKV, and tiered backend.
 - Test with git clone/status/build small-file workload.
 - Test multi-client behavior.
-- Register the storage backend only after GC/fsck, real MySQL/TiDB+S3 integration, Copy-unsupported compatibility, and benchmark gates pass.
+- Register the storage backend only after GC/fsck, real MySQL/TiDB+S3 integration, Copy-unsupported compatibility, fail-closed runtime config, and benchmark gates pass.
 - Enforce fixed volume config and threshold during runtime configuration.
 
 ## Acceptance criteria
