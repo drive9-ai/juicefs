@@ -141,6 +141,9 @@ func (s *tieredHarnessStore) Head(ctx context.Context, key string) (Object, erro
 	if !ok {
 		return nil, os.ErrNotExist
 	}
+	if _, ok := s.payloadLocked(entry); !ok {
+		return nil, errors.New("indexed payload missing")
+	}
 	return &harnessObject{obj{key: key, size: entry.size, mtime: entry.createdAt, isDir: strings.HasSuffix(key, "/")}}, nil
 }
 
@@ -161,28 +164,51 @@ func (s *tieredHarnessStore) Delete(ctx context.Context, key string, getters ...
 }
 
 func (s *tieredHarnessStore) List(ctx context.Context, prefix, startAfter, token, delimiter string, limit int64, followLink bool) ([]Object, bool, string, error) {
-	if delimiter != "" {
-		return nil, false, "", notSupported
+	if token != "" {
+		startAfter = token
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	keys := make([]string, 0, len(s.index))
+	seen := make(map[string]struct{})
 	for key := range s.index {
-		if strings.HasPrefix(key, prefix) && key > startAfter {
-			keys = append(keys, key)
+		if !strings.HasPrefix(key, prefix) || key <= startAfter {
+			continue
 		}
+		listKey := key
+		if delimiter != "" {
+			rest := strings.TrimPrefix(key, prefix)
+			if i := strings.Index(rest, delimiter); i >= 0 {
+				listKey = prefix + rest[:i+len(delimiter)]
+			}
+		}
+		if listKey <= startAfter {
+			continue
+		}
+		if _, ok := seen[listKey]; ok {
+			continue
+		}
+		seen[listKey] = struct{}{}
+		keys = append(keys, listKey)
 	}
 	sort.Strings(keys)
+	hasMore := false
+	nextToken := ""
 	if limit > 0 && int64(len(keys)) > limit {
+		hasMore = true
+		nextToken = keys[limit-1]
 		keys = keys[:limit]
 	}
 	objects := make([]Object, 0, len(keys))
 	for _, key := range keys {
-		entry := s.index[key]
-		objects = append(objects, &harnessObject{obj{key: key, size: entry.size, mtime: entry.createdAt, isDir: strings.HasSuffix(key, "/")}})
+		if entry, ok := s.index[key]; ok {
+			objects = append(objects, &harnessObject{obj{key: key, size: entry.size, mtime: entry.createdAt, isDir: strings.HasSuffix(key, "/")}})
+			continue
+		}
+		objects = append(objects, &harnessObject{obj{key: key, mtime: time.Now(), isDir: strings.HasSuffix(key, delimiter)}})
 	}
-	return generateListResult(objects, limit)
+	return objects, hasMore, nextToken, nil
 }
 
 func (s *tieredHarnessStore) Copy(ctx context.Context, dst, src string) error {
@@ -217,6 +243,16 @@ func (s *tieredHarnessStore) payloadCounts() (small, large int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.smallPayloads), len(s.largePayloads)
+}
+
+func (s *tieredHarnessStore) deleteActivePayloadForTest(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.index[key]
+	if !ok {
+		return
+	}
+	s.deletePayloadLocked(entry)
 }
 
 func (s *tieredHarnessStore) setFault(point harnessFault, err error) {
@@ -383,6 +419,70 @@ func TestTieredHarnessListUsesBinaryObjectKeyOrdering(t *testing.T) {
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("keys = %#v, want %#v", got, want)
 	}
+}
+
+func TestTieredHarnessListSupportsTokenAndDelimiter(t *testing.T) {
+	store := newTieredHarnessStore(4)
+	ctx := context.Background()
+	keys := []string{"p/a/1", "p/a/2", "p/b/1", "p/c"}
+	for _, key := range keys {
+		if err := store.Put(ctx, key, strings.NewReader("x")); err != nil {
+			t.Fatalf("put %q: %v", key, err)
+		}
+	}
+	first, hasMore, token, err := store.List(ctx, "p/", "", "", "/", 2, false)
+	if err != nil {
+		t.Fatalf("list first: %v", err)
+	}
+	if !hasMore || token != "p/b/" {
+		t.Fatalf("page = hasMore %v token %q", hasMore, token)
+	}
+	if got := objectKeys(first); strings.Join(got, "|") != "p/a/|p/b/" {
+		t.Fatalf("first keys = %#v", got)
+	}
+	second, hasMore, token, err := store.List(ctx, "p/", "", token, "/", 2, false)
+	if err != nil {
+		t.Fatalf("list second: %v", err)
+	}
+	if hasMore || token != "" {
+		t.Fatalf("second page = hasMore %v token %q", hasMore, token)
+	}
+	if got := objectKeys(second); strings.Join(got, "|") != "p/c" {
+		t.Fatalf("second keys = %#v", got)
+	}
+}
+
+func TestTieredHarnessCrashAfterSmallPayloadBeforeIndexCommit(t *testing.T) {
+	store := newTieredHarnessStore(4)
+	store.setFault(faultAfterSmallBlobWrite, errors.New("crash before small index"))
+	if err := store.Put(context.Background(), "k", strings.NewReader("abc")); err == nil {
+		t.Fatal("expected injected put error")
+	}
+	if _, err := store.Head(context.Background(), "k"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("head after failed put = %v", err)
+	}
+	if small, large := store.payloadCounts(); small != 1 || large != 0 {
+		t.Fatalf("payload should be invisible orphan for GC, small=%d large=%d", small, large)
+	}
+}
+
+func TestTieredHarnessHeadDetectsMissingIndexedPayload(t *testing.T) {
+	store := newTieredHarnessStore(4)
+	if err := store.Put(context.Background(), "k", strings.NewReader("abc")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	store.deleteActivePayloadForTest("k")
+	if _, err := store.Head(context.Background(), "k"); err == nil || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("head missing indexed payload = %v, want corruption", err)
+	}
+}
+
+func objectKeys(objects []Object) []string {
+	keys := make([]string, 0, len(objects))
+	for _, object := range objects {
+		keys = append(keys, object.Key())
+	}
+	return keys
 }
 
 func TestTieredHarnessCopyUnsupported(t *testing.T) {
