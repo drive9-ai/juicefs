@@ -379,14 +379,19 @@ Constraints:
 - Cover missing indexed payloads, corrupt indexed payloads, orphan payloads, and active-generation safety.
 - Do not delete data in the checker. Cleanup remains explicit and must re-read index before deleting payloads.
 
-### Later — runtime registration/admin path (`drive9-ai/juicefs`)
-- Register the storage backend only after GC/fsck, real MySQL/TiDB+S3 integration, and Copy-unsupported compatibility gates pass.
-- Enforce fixed volume config and threshold during runtime configuration.
+### PR 6 — integration/compatibility gates (`drive9-ai/juicefs`)
+- Prove the experimental store still satisfies the package-level `ObjectStorage` compatibility suite while returning unsupported for Copy/multipart APIs.
+- Add env-gated real MySQL/TiDB + S3-compatible object-store integration tests.
+- Required integration environment variables follow existing JuiceFS object tests: `MYSQL_ADDR`, optional `MYSQL_USER`/`MYSQL_PASSWORD`, `MINIO_TEST_BUCKET`, `MINIO_ACCESS_KEY`, and `MINIO_SECRET_KEY`.
+- Cover real small/large routing, small<->large overwrite, cleanup/checker behavior, and upload-before-index-commit failure recovery.
+- Keep the backend unregistered and non-production.
 
-### PR 6 — integration benchmark/e2e (`drive9-ai/juicefs`; optional Drive9 integration config in `drive9-ai/drive9`)
+### Later — benchmark/e2e and runtime registration (`drive9-ai/juicefs`; optional Drive9 integration config in `drive9-ai/drive9`)
 - Compare S3+writeback, whole-volume TiDB/TiKV, and tiered backend.
 - Test with git clone/status/build small-file workload.
 - Test multi-client behavior.
+- Register the storage backend only after GC/fsck, real MySQL/TiDB+S3 integration, Copy-unsupported compatibility, and benchmark gates pass.
+- Enforce fixed volume config and threshold during runtime configuration.
 
 ## Acceptance criteria
 - No Drive9 overlay/control-plane code decides file tier.
