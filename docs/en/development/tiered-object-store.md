@@ -10,8 +10,10 @@ This issue is a **Drive9 tracking/design issue** for the tiered-storage requirem
 
 Actual storage-engine implementation belongs in one of these places:
 
-1. `db9-ai/juicefs` fork, or
+1. `drive9-ai/juicefs` fork, or
 2. upstream JuiceFS if accepted there.
+
+Do not implement or review tiered-storage code under `db9-ai/*`.
 
 `drive9-ai/drive9` must not implement file-size routing in overlay/FUSE/control-plane code. Drive9 changes, if any, are limited to selecting/configuring a JuiceFS binary/storage backend after the backend exists.
 
@@ -354,29 +356,29 @@ Constraints:
 
 ## PR split
 
-### PR 1 — design + test harness
-- Add design document.
-- Add fault-injectable in-memory `TieredObjectStore` tests.
+### PR 1 — design + test harness (`drive9-ai/drive9` + `drive9-ai/juicefs`)
+- `drive9-ai/drive9`: add/maintain this tracking design document.
+- `drive9-ai/juicefs`: add fault-injectable in-memory `TieredObjectStore` tests.
 - Validate Put/Get/Head/Delete/List semantics independent of JuiceFS.
 
-### PR 2 — TiDB/MySQL small payload + index store
+### PR 2 — TiDB/MySQL small payload + index store (`drive9-ai/juicefs`)
 - Implement `drive9_object_index`, `drive9_object_blob`, cleanup queue.
 - Cover transaction semantics and small-object overwrite cases.
 
-### PR 3 — S3 large payload adapter
+### PR 3 — S3 large payload adapter (`drive9-ai/juicefs`)
 - Implement S3 immutable generation upload path.
 - Cover large-object Put/Get/Head/Delete and orphan generation cleanup.
 
-### PR 4 — combined TieredObjectStore backend
+### PR 4 — combined TieredObjectStore backend (`drive9-ai/juicefs`)
 - Register storage backend.
 - Enforce fixed volume config and threshold.
 - Implement List/ListAll, Copy fallback, Delete cleanup queue.
 
-### PR 5 — gc/fsck command or admin path
+### PR 5 — gc/fsck command or admin path (`drive9-ai/juicefs`)
 - Add tiered backend fsck/gc checker.
 - Cover orphan/corruption cases and cleanup grace.
 
-### PR 6 — integration benchmark/e2e
+### PR 6 — integration benchmark/e2e (`drive9-ai/juicefs`; optional Drive9 integration config in `drive9-ai/drive9`)
 - Compare S3+writeback, whole-volume TiDB/TiKV, and tiered backend.
 - Test with git clone/status/build small-file workload.
 - Test multi-client behavior.
