@@ -393,12 +393,40 @@ Constraints:
 - Existing volume config mismatch must fail closed through the SQL metadata guard.
 - Keep the backend unregistered and non-production.
 
+### PR 8 — admin cleanup gate (`drive9-ai/juicefs`)
+- Add an internal maintenance entrypoint that combines report-only checker output with explicit cleanup budgets.
+- Cleanup budgets must be explicit per category: small queued payloads, large queued payloads, and unindexed large orphans.
+- Negative cleanup limits fail closed.
+- Zero cleanup limits report before/after state without deleting payloads.
+- Positive cleanup limits must fail closed when the pre-cleanup check reports missing or corrupt indexed payloads.
+- Cleanup must continue to re-read the index before deleting payloads and must not delete active generations.
+- Keep the backend unregistered and non-production.
+
 ### Later — benchmark/e2e and runtime registration (`drive9-ai/juicefs`; optional Drive9 integration config in `drive9-ai/drive9`)
 - Compare S3+writeback, whole-volume TiDB/TiKV, and tiered backend.
 - Test with git clone/status/build small-file workload.
 - Test multi-client behavior.
 - Register the storage backend only after GC/fsck, real MySQL/TiDB+S3 integration, Copy-unsupported compatibility, fail-closed runtime config, and benchmark gates pass.
 - Enforce fixed volume config and threshold during runtime configuration.
+
+## Real environment gate commands
+
+Before runtime registration, run the integration suite against real MySQL/TiDB and S3-compatible object storage:
+
+```bash
+MYSQL_ADDR='tcp(127.0.0.1:4000)/test' \
+MYSQL_USER='root' \
+MYSQL_PASSWORD='' \
+MINIO_TEST_BUCKET='http://127.0.0.1:9000/juicefs-tiered-test' \
+MINIO_ACCESS_KEY='minioadmin' \
+MINIO_SECRET_KEY='minioadmin' \
+GOPROXY=https://goproxy.cn,direct \
+/usr/local/go/bin/go test -tags nosqlite ./pkg/object \
+  -run 'TestTieredStoreMySQLMinIO|TestTieredSQLMySQLIntegration' \
+  -count=1 -v
+```
+
+Production enablement is blocked if these tests skip or fail.
 
 ## Acceptance criteria
 - No Drive9 overlay/control-plane code decides file tier.
@@ -411,6 +439,6 @@ Constraints:
 - Delete visibility is index-driven.
 - small->large and large->small overwrites are generation-safe.
 - Crash tests prove no partial generation becomes visible.
-- GC/fsck detects corruption and removes orphans safely.
+- GC/fsck detects corruption and removes orphans safely; destructive cleanup fails closed if indexed payload corruption is present.
 - Multi-client tests pass.
 - Benchmark demonstrates measurable value over tuned JuiceFS S3/writeback before production adoption.
