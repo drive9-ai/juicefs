@@ -369,14 +369,19 @@ Constraints:
 - Implement S3 immutable generation upload path.
 - Cover large-object Put/Get/Head/Delete and orphan generation cleanup.
 
-### PR 4 — combined TieredObjectStore backend (`drive9-ai/juicefs`)
-- Register storage backend.
-- Enforce fixed volume config and threshold.
-- Implement List/ListAll, Copy fallback, Delete cleanup queue.
+### PR 4 — experimental combined TieredObjectStore (`drive9-ai/juicefs`)
+- Combine the SQL small/index store with the large object store behind one `ObjectStorage`.
+- Keep the backend unregistered and non-production.
+- Implement object-size routing, List/ListAll, unsupported Copy, Delete cleanup queue, and generation-safe cleanup helpers.
 
-### PR 5 — gc/fsck command or admin path (`drive9-ai/juicefs`)
-- Add tiered backend fsck/gc checker.
-- Cover orphan/corruption cases and cleanup grace.
+### PR 5 — gc/fsck checker (`drive9-ai/juicefs`)
+- Add a report-only tiered backend checker.
+- Cover missing indexed payloads, corrupt indexed payloads, orphan payloads, and active-generation safety.
+- Do not delete data in the checker. Cleanup remains explicit and must re-read index before deleting payloads.
+
+### Later — runtime registration/admin path (`drive9-ai/juicefs`)
+- Register the storage backend only after GC/fsck, real MySQL/TiDB+S3 integration, and Copy-unsupported compatibility gates pass.
+- Enforce fixed volume config and threshold during runtime configuration.
 
 ### PR 6 — integration benchmark/e2e (`drive9-ai/juicefs`; optional Drive9 integration config in `drive9-ai/drive9`)
 - Compare S3+writeback, whole-volume TiDB/TiKV, and tiered backend.

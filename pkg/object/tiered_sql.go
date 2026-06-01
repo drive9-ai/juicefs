@@ -80,6 +80,11 @@ type tieredSQLCleanupItem struct {
 	createdAt  time.Time
 }
 
+type tieredSQLSmallPayloadItem struct {
+	key        []byte
+	generation uint64
+}
+
 func newTieredSQLStore(ctx context.Context, db *sql.DB, cfg tieredSQLConfig) (*tieredSQLStore, error) {
 	if db == nil {
 		return nil, errors.New("nil db")
@@ -329,6 +334,24 @@ func (s *tieredSQLStore) list(ctx context.Context, prefix, startAfter, token, de
 	return entries, hasMore, nextToken, nil
 }
 
+func (s *tieredSQLStore) activeIndexEntries(ctx context.Context) ([]tieredSQLIndexEntry, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT object_key, generation, tier, size, checksum, state, payload_ref, updated_at FROM tiered_object_index WHERE volume_id = ? AND state = ? ORDER BY object_key", s.volumeID, tieredIndexStateActive)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	entries := make([]tieredSQLIndexEntry, 0)
+	for rows.Next() {
+		var entry tieredSQLIndexEntry
+		if err := scanTieredIndex(rows, &entry); err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+	return entries, rows.Err()
+}
+
 func (s *tieredSQLStore) drainSmallCleanup(ctx context.Context, limit int) (int, error) {
 	rows, err := s.db.QueryContext(ctx, "SELECT object_key, generation, tier, payload_ref, reason, created_at FROM tiered_object_gc_queue WHERE volume_id = ? AND tier = ? ORDER BY created_at, object_key LIMIT ?", s.volumeID, tieredTierSmall, limit)
 	if err != nil {
@@ -420,10 +443,53 @@ func (s *tieredSQLStore) payloadRefReferenced(ctx context.Context, payloadRef []
 	return count > 0, err
 }
 
+func (s *tieredSQLStore) payloadRefActive(ctx context.Context, payloadRef []byte) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM tiered_object_index WHERE volume_id = ? AND payload_ref = ?", s.volumeID, payloadRef).Scan(&count)
+	return count > 0, err
+}
+
 func (s *tieredSQLStore) smallBlobExists(ctx context.Context, key string, generation uint64) (bool, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM tiered_object_blob WHERE volume_id = ? AND object_key = ? AND generation = ?", s.volumeID, []byte(key), int64(generation)).Scan(&count)
 	return count > 0, err
+}
+
+func (s *tieredSQLStore) smallPayloadItems(ctx context.Context) ([]tieredSQLSmallPayloadItem, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT object_key, generation FROM tiered_object_blob WHERE volume_id = ? ORDER BY object_key, generation", s.volumeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]tieredSQLSmallPayloadItem, 0)
+	for rows.Next() {
+		var item tieredSQLSmallPayloadItem
+		var gen int64
+		if err := rows.Scan(&item.key, &gen); err != nil {
+			return nil, err
+		}
+		item.generation = uint64(gen)
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *tieredSQLStore) checkSmallPayload(ctx context.Context, entry tieredSQLIndexEntry) (bool, bool, error) {
+	var data []byte
+	var size int64
+	var checksum []byte
+	err := s.db.QueryRowContext(ctx, "SELECT data, size, checksum FROM tiered_object_blob WHERE volume_id = ? AND object_key = ? AND generation = ?", s.volumeID, entry.key, int64(entry.generation)).Scan(&data, &size, &checksum)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if size != int64(len(data)) || size != entry.size || !bytes.Equal(checksum, entry.checksum) || !bytes.Equal(tieredChecksum(data), entry.checksum) {
+		return false, true, nil
+	}
+	return false, false, nil
 }
 
 func (s *tieredSQLStore) insertActiveCleanupForTest(ctx context.Context, key string, generation uint64, tier string) error {
