@@ -52,10 +52,10 @@ Do not use `jfs_*` table names. The persisted protocol should not be locked to J
 If Drive9 maintains the backend, use:
 
 ```text
-drive9_object_index
-drive9_object_blob
-drive9_object_gc_queue
-drive9_object_meta
+tiered_object_index
+tiered_object_blob
+tiered_object_gc_queue
+tiered_object_meta
 ```
 
 If the feature is prepared for upstream JuiceFS, use neutral names:
@@ -90,7 +90,7 @@ This prevents SQL collation from changing object-listing semantics.
 
 ## Data model
 
-### `drive9_object_index`
+### `tiered_object_index`
 The index is the source of visibility truth.
 
 Columns:
@@ -117,7 +117,7 @@ Unique payload identity:
 (volume_id, object_key, generation)
 ```
 
-### `drive9_object_blob`
+### `tiered_object_blob`
 Only stores small object payloads.
 
 Columns:
@@ -160,8 +160,8 @@ Temporary keys are never referenced by active index rows. A large-object Put is 
 1. Read/buffer the object payload.
 2. Calculate `size`, volume-fixed `checksum`, and new monotonic/unique `generation`.
 3. In one TiDB transaction:
-   - insert `drive9_object_blob(volume_id, object_key, generation, data, checksum)`;
-   - atomically update `drive9_object_index` to point to `(tier='tidb', generation, payload_ref=generation, state='active')`;
+   - insert `tiered_object_blob(volume_id, object_key, generation, data, checksum)`;
+   - atomically update `tiered_object_index` to point to `(tier='tidb', generation, payload_ref=generation, state='active')`;
    - enqueue old payload cleanup if old generation exists.
 4. Commit makes the new version visible.
 5. Cleanup old S3/TiDB payload asynchronously.
@@ -170,7 +170,7 @@ Temporary keys are never referenced by active index rows. A large-object Put is 
 1. Stream payload to an immutable S3 generation key: `objects/<volume_id>/<generation>`.
 2. Verify size/checksum.
 3. In one TiDB transaction:
-   - atomically update `drive9_object_index` to point to `(tier='s3', generation, payload_ref=s3_generation_key, state='active')`;
+   - atomically update `tiered_object_index` to point to `(tier='s3', generation, payload_ref=s3_generation_key, state='active')`;
    - enqueue old payload cleanup if old generation exists.
 4. Commit makes the new version visible.
 5. Cleanup old payload asynchronously.
@@ -205,7 +205,7 @@ Tests must cover concurrent small/small, small/large, large/small, and large/lar
 ### Get / Head
 1. Read active index row by `(volume_id, object_key)`.
 2. If not found, return not-exist.
-3. If tier is `tidb`, read exact `(object_key, generation)` from `drive9_object_blob`.
+3. If tier is `tidb`, read exact `(object_key, generation)` from `tiered_object_blob`.
 4. If tier is `s3`, read exact `payload_ref` from S3.
 5. Validate size/checksum when feasible.
 6. Missing indexed payload is corruption, not a normal 404.
@@ -217,7 +217,7 @@ Tests must cover concurrent small/small, small/large, large/small, and large/lar
 4. Cleanup failure leaves an orphan; it must be recoverable by GC.
 
 ### List(prefix, marker, delimiter, limit)
-List must use `drive9_object_index` as the source of truth.
+List must use `tiered_object_index` as the source of truth.
 
 Rules:
 
@@ -362,7 +362,7 @@ Constraints:
 - Validate Put/Get/Head/Delete/List semantics independent of JuiceFS.
 
 ### PR 2 — TiDB/MySQL small payload + index store (`drive9-ai/juicefs`)
-- Implement `drive9_object_index`, `drive9_object_blob`, cleanup queue.
+- Implement `tiered_object_index`, `tiered_object_blob`, cleanup queue.
 - Cover transaction semantics and small-object overwrite cases.
 
 ### PR 3 — S3 large payload adapter (`drive9-ai/juicefs`)
