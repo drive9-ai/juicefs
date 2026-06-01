@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-var errTieredStoreExperimental = errors.New("tiered object store is experimental and not registered")
+var errTieredStoreExperimental = errors.New("tiered object store is experimental and disabled")
 
 type tieredObjectStore struct {
 	DefaultObjectStorage
@@ -248,13 +248,6 @@ func (s *tieredObjectStore) validateLargeHead(ctx context.Context, entry tieredS
 	}
 	if object.Size() != entry.size {
 		return fmt.Errorf("%w: indexed large payload size mismatch", errTieredSQLCorruption)
-	}
-	return nil
-}
-
-func ensureTieredStoreNotRegistered() error {
-	if _, ok := storages["tiered"]; ok {
-		return errTieredStoreExperimental
 	}
 	return nil
 }
