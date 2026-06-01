@@ -27,12 +27,13 @@ func newTestTieredObjectStore(t *testing.T, threshold int64) *tieredObjectStore 
 	return store
 }
 
-func TestTieredStoreIsNotRuntimeRegistered(t *testing.T) {
-	if err := ensureTieredStoreNotRegistered(); err != nil {
-		t.Fatalf("tiered backend must remain unregistered: %v", err)
+func TestTieredStoreDefaultRuntimeConfigFailsClosed(t *testing.T) {
+	store, err := CreateStorage("tiered", "", "", "", "")
+	if store != nil {
+		t.Fatalf("default tiered backend returned store %+v", store)
 	}
-	if _, err := CreateStorage("tiered", "", "", "", ""); err == nil {
-		t.Fatal("CreateStorage(\"tiered\") unexpectedly succeeded")
+	if !errors.Is(err, errTieredStoreExperimental) {
+		t.Fatalf("default tiered backend error = %v, want %v", err, errTieredStoreExperimental)
 	}
 }
 

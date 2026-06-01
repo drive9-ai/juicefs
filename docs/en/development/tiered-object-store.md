@@ -337,9 +337,11 @@ Volume-level config:
 
 ```text
 storage = tiered
-bucket = tiered://<volume-id>
-tiered-small-backend = mysql/tidb/tikv DSN
-tiered-large-backend = s3 bucket URL
+bucket = tiered://<volume-id>?experimental=true&integration=verified&sql_dialect=mysql&sql_dsn_env=JFS_TIERED_SQL_DSN&small_threshold=262144&large_storage=s3&large_endpoint=https%3A%2F%2Fs3.example.com%2Fbucket
+tiered-experimental-env = JUICEFS_TIERED_OBJECT_STORE_EXPERIMENTAL=true
+tiered-sql-dsn-env = JFS_TIERED_SQL_DSN
+tiered-sql-dsn = mysql/tidb DSN stored only in the process environment, never in bucket URL/query
+tiered-large-backend = normal JuiceFS object storage name + endpoint
 tiered-small-threshold = 64KiB / 256KiB / 1MiB
 tiered-gc-grace = 24h
 tiered-checksum = crc32c or sha256
@@ -348,6 +350,10 @@ tiered-schema-version = 1
 
 Constraints:
 
+- the `tiered` storage name may be registered before production enablement, but it must fail closed by default;
+- runtime construction requires all gates: endpoint `experimental=true`, process env `JUICEFS_TIERED_OBJECT_STORE_EXPERIMENTAL=true`, endpoint `integration=verified`, and complete valid config;
+- SQL DSN must not appear in `bucket`/endpoint query, logs, or persisted JuiceFS format metadata; endpoint config stores only a safe environment-variable name that contains the DSN;
+- missing/invalid runtime config must fail before opening SQL or creating `tiered_object_*` schema;
 - threshold is volume-level fixed config;
 - checksum algorithm is volume-level fixed config;
 - threshold must be capped by the supported TiDB/TiKV blob payload size and by an operational safety max;
@@ -402,16 +408,24 @@ Constraints:
 - Cleanup must continue to re-read the index before deleting payloads and must not delete active generations.
 - Keep the backend unregistered and non-production.
 
-### Later — benchmark/e2e and runtime registration (`drive9-ai/juicefs`; optional Drive9 integration config in `drive9-ai/drive9`)
+### PR 9 — fail-closed runtime registration gate (`drive9-ai/juicefs`)
+- Register the `tiered` storage name with a fail-closed creator.
+- Default `CreateStorage("tiered", ...)` must return experimental-disabled without creating schema or changing normal JuiceFS behavior.
+- Runtime construction must require endpoint `experimental=true`, env `JUICEFS_TIERED_OBJECT_STORE_EXPERIMENTAL=true`, endpoint `integration=verified`, valid SQL dialect, SQL DSN env-var name, volume ID, positive threshold, non-recursive large storage, and large endpoint.
+- The endpoint must never carry secret-bearing SQL DSN material. It may carry only the env var name used to read the DSN from the process environment.
+- Invalid/missing config must fail before opening SQL or creating `tiered_object_*` schema.
+- This is still not production enablement; real-environment gates remain mandatory before operational use.
+
+### Later — benchmark/e2e and production enablement (`drive9-ai/juicefs`; optional Drive9 integration config in `drive9-ai/drive9`)
 - Compare S3+writeback, whole-volume TiDB/TiKV, and tiered backend.
 - Test with git clone/status/build small-file workload.
 - Test multi-client behavior.
-- Register the storage backend only after GC/fsck, real MySQL/TiDB+S3 integration, Copy-unsupported compatibility, fail-closed runtime config, and benchmark gates pass.
+- Promote the fail-closed registration to an operationally enabled backend only after GC/fsck, real MySQL/TiDB+S3 integration, Copy-unsupported compatibility, fail-closed runtime config, and benchmark gates pass.
 - Enforce fixed volume config and threshold during runtime configuration.
 
 ## Real environment gate commands
 
-Before runtime registration, run the integration suite against real MySQL/TiDB and S3-compatible object storage:
+Before production enablement, run the integration suite against real MySQL/TiDB and S3-compatible object storage:
 
 ```bash
 MYSQL_ADDR='tcp(127.0.0.1:4000)/test' \
